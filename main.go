@@ -83,8 +83,18 @@ func (e *RDSExporter) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	// Update cache
-	e.cache = []prometheus.Metric{}
+	go e.updateCache()
+
+	// Return cached metrics when cache in updating process
+	for _, metric := range e.cache {
+		ch <- metric
+	}
+}
+
+func (e *RDSExporter) updateCache() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	accountClient := account.NewFromConfig(e.sdkConfig)
 	regionOutput, err := accountClient.ListRegions(context.TODO(), &account.ListRegionsInput{
 		RegionOptStatusContains: []types.RegionOptStatus{types.RegionOptStatusEnabled, types.RegionOptStatusEnabledByDefault}})
@@ -93,82 +103,100 @@ func (e *RDSExporter) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	for _, region := range regionOutput.Regions {
-		regionName := *region.RegionName
-		rdsClient := rds.NewFromConfig(e.sdkConfig, func(o *rds.Options) { o.Region = regionName })
-		var marker *string
-		for {
-			output, err := rdsClient.DescribeDBInstances(context.TODO(), &rds.DescribeDBInstancesInput{Marker: marker})
-			if err != nil {
-				log.Printf("Couldn't list RDS instances in region %s : %v", regionName, err)
-				break
-			}
-			//{"dimension_DBInstanceIdentifier", "az", "secondary_az", "storage_type", "region", "name", "db_instance_class", "engine"}
-			for _, instance := range output.DBInstances {
-				labels := []string{}
-				labels = append(labels, *instance.DBInstanceIdentifier)
-				labels = append(labels, *instance.AvailabilityZone)
-				if instance.SecondaryAvailabilityZone != nil {
-					labels = append(labels, *instance.SecondaryAvailabilityZone)
-				} else {
-					labels = append(labels, "")
-				}
-				labels = append(labels, *instance.StorageType)
-				labels = append(labels, regionName)
-				labels = append(labels, *instance.DBInstanceArn)
-				labels = append(labels, *instance.DBInstanceClass)
-				labels = append(labels, *instance.Engine)
+	var wg sync.WaitGroup
+	metricsChan := make(chan prometheus.Metric, 100)
 
-				// fetch tags
-				tagsOutput, err := rdsClient.ListTagsForResource(context.TODO(), &rds.ListTagsForResourceInput{
-					ResourceName: instance.DBInstanceArn,
-				})
-				if err != nil {
-					log.Printf("Error listing tags for RDS instance %s : %v", *instance.DBInstanceArn, err)
+	for _, region := range regionOutput.Regions {
+		wg.Add(1)
+		go func(regionName string) {
+			defer wg.Done()
+			e.collectRegionMetrics(regionName, metricsChan)
+		}(*region.RegionName)
+	}
+	go func() {
+		wg.Wait()
+		close(metricsChan)
+	}()
+	newCache := []prometheus.Metric{}
+	for metric := range metricsChan {
+		newCache = append(newCache, metric)
+	}
+	e.cache = newCache
+	e.lastUpdate = time.Now()
+}
+
+func (e *RDSExporter) collectRegionMetrics(regionName string, ch chan<- prometheus.Metric) {
+	rdsClient := rds.NewFromConfig(e.sdkConfig, func(o *rds.Options) { o.Region = regionName })
+	var marker *string
+	for {
+		output, err := rdsClient.DescribeDBInstances(context.TODO(), &rds.DescribeDBInstancesInput{Marker: marker})
+		if err != nil {
+			log.Printf("Couldn't list RDS instances in region %s : %v", regionName, err)
+			break
+		}
+		//{"dimension_DBInstanceIdentifier", "az", "secondary_az", "storage_type", "region", "name", "db_instance_class", "engine"}
+		for _, instance := range output.DBInstances {
+			labels := []string{}
+			labels = append(labels, *instance.DBInstanceIdentifier)
+			labels = append(labels, *instance.AvailabilityZone)
+			if instance.SecondaryAvailabilityZone != nil {
+				labels = append(labels, *instance.SecondaryAvailabilityZone)
+			} else {
+				labels = append(labels, "")
+			}
+			labels = append(labels, *instance.StorageType)
+			labels = append(labels, regionName)
+			labels = append(labels, *instance.DBInstanceArn)
+			labels = append(labels, *instance.DBInstanceClass)
+			labels = append(labels, *instance.Engine)
+
+			// fetch tags
+			tagsOutput, err := rdsClient.ListTagsForResource(context.TODO(), &rds.ListTagsForResourceInput{
+				ResourceName: instance.DBInstanceArn,
+			})
+			if err != nil {
+				log.Printf("Error listing tags for RDS instance %s : %v", *instance.DBInstanceArn, err)
+			} else {
+				if len(tagsOutput.TagList) == 0 {
+					for range tags {
+						labels = append(labels, "")
+					}
 				} else {
-					if len(tagsOutput.TagList) == 0 {
-						for range tags {
-							labels = append(labels, "")
-						}
-					} else {
-						for _, tag := range tagsOutput.TagList {
-							if tag.Key != nil && tag.Value != nil && slices.Contains(tags, *tag.Key) {
-								labels = append(labels, *tag.Value)
-							}
+					for _, tag := range tagsOutput.TagList {
+						if tag.Key != nil && tag.Value != nil && slices.Contains(tags, *tag.Key) {
+							labels = append(labels, *tag.Value)
 						}
 					}
 				}
-				// New metrics
-				if instance.AllocatedStorage != nil {
-					metric := prometheus.MustNewConstMetric(allocatedStorageDesc, prometheus.GaugeValue, float64(*instance.AllocatedStorage), labels...)
-					e.cache = append(e.cache, metric)
-					ch <- metric
-				}
-				if instance.MaxAllocatedStorage != nil {
-					metric := prometheus.MustNewConstMetric(maxAllocatedStorageDesc, prometheus.GaugeValue, float64(*instance.MaxAllocatedStorage), labels...)
-					e.cache = append(e.cache, metric)
-					ch <- metric
-				}
-				if instance.Iops != nil {
-					metric := prometheus.MustNewConstMetric(iopsDesc, prometheus.GaugeValue, float64(*instance.Iops), labels...)
-					e.cache = append(e.cache, metric)
-					ch <- metric
-				}
-				if instance.StorageThroughput != nil {
-					metric := prometheus.MustNewConstMetric(storageThroughputDesc, prometheus.GaugeValue, float64(*instance.StorageThroughput), labels...)
-					e.cache = append(e.cache, metric)
-					ch <- metric
-				}
 			}
-
-			if output.Marker == nil {
-				break
-			} else {
-				marker = output.Marker
+			// New metrics
+			if instance.AllocatedStorage != nil {
+				metric := prometheus.MustNewConstMetric(allocatedStorageDesc, prometheus.GaugeValue, float64(*instance.AllocatedStorage), labels...)
+				e.cache = append(e.cache, metric)
+				ch <- metric
+			}
+			if instance.MaxAllocatedStorage != nil {
+				metric := prometheus.MustNewConstMetric(maxAllocatedStorageDesc, prometheus.GaugeValue, float64(*instance.MaxAllocatedStorage), labels...)
+				e.cache = append(e.cache, metric)
+				ch <- metric
+			}
+			if instance.Iops != nil {
+				metric := prometheus.MustNewConstMetric(iopsDesc, prometheus.GaugeValue, float64(*instance.Iops), labels...)
+				e.cache = append(e.cache, metric)
+				ch <- metric
+			}
+			if instance.StorageThroughput != nil {
+				metric := prometheus.MustNewConstMetric(storageThroughputDesc, prometheus.GaugeValue, float64(*instance.StorageThroughput), labels...)
+				e.cache = append(e.cache, metric)
+				ch <- metric
 			}
 		}
+		if output.Marker == nil {
+			break
+		} else {
+			marker = output.Marker
+		}
 	}
-	e.lastUpdate = time.Now()
 }
 
 func main() {
