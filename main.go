@@ -76,7 +76,7 @@ func (e *RDSExporter) Collect(ch chan<- prometheus.Metric) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if time.Since(e.lastUpdate) > time.Hour {
+	if time.Since(e.lastUpdate) < time.Hour {
 		for _, metric := range e.cache {
 			ch <- metric
 		}
@@ -138,6 +138,7 @@ func (e *RDSExporter) Collect(ch chan<- prometheus.Metric) {
 						}
 					}
 				}
+				// New metrics
 				if instance.AllocatedStorage != nil {
 					metric := prometheus.MustNewConstMetric(allocatedStorageDesc, prometheus.GaugeValue, float64(*instance.AllocatedStorage), labels...)
 					e.cache = append(e.cache, metric)
