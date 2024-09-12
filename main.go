@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"flag"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/account"
 	"github.com/aws/aws-sdk-go-v2/service/account/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/deeb00/rdscli_exporter/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log"
 	"net/http"
+	"rdscli_exporter/pkg/utils"
 	"slices"
 	"sync"
 	"time"
@@ -200,6 +203,7 @@ func (e *RDSExporter) collectRegionMetrics(regionName string, ch chan<- promethe
 }
 
 func main() {
+	listenPort := flag.String("port", utils.LookupEnv)
 	sdkConfig, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Fatalf("unable to load SDK config: %v", err)
@@ -209,4 +213,5 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	log.Println("Listening on :9090")
 	log.Fatal(http.ListenAndServe(":9090", nil))
+	// унести в флаг таймаут, порт
 }
