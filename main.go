@@ -212,6 +212,7 @@ func main() {
 	cacheTTL := flag.Duration("cache_ttl", time.Hour, "Cache TTL")
 	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	sdkConfig, err := config.LoadDefaultConfig(ctx)
+	flag.Parse()
 	if err != nil {
 		log.Fatalf("unable to load SDK config: %v", err)
 	}
