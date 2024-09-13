@@ -1,4 +1,4 @@
-module rdscli_exporter
+module github.com/deeb00/rdscli_exporter
 
 go 1.22
 

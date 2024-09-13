@@ -8,20 +8,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/account"
 	"github.com/aws/aws-sdk-go-v2/service/account/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
-	"github.com/deeb00/rdscli_exporter/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log"
 	"net/http"
-	"rdscli_exporter/pkg/utils"
+	"os/signal"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 )
 
 var (
-	baseLabels = []string{"dimension_DBInstanceIdentifier", "az", "secondary_az", "storage_type", "region", "name", "db_instance_class", "engine"}
-	tags       = []string{"billing", "purpose", "team", "region", "environment"}
+	baseLabels = []string{"dimension_DBInstanceIdentifier", "az", "secondary_az", "storage_type", "region", "db_instance_class", "engine"}
+	tags       = []string{"purpose", "team", "region", "environment"}
 	dynLabels  = createDynLabels(baseLabels, tags)
 
 	allocatedStorageDesc = prometheus.NewDesc(
@@ -49,6 +49,7 @@ var (
 type RDSExporter struct {
 	sdkConfig  aws.Config
 	cache      []prometheus.Metric
+	cacheTTL   time.Duration
 	lastUpdate time.Time
 	mu         sync.Mutex
 }
@@ -60,10 +61,11 @@ func createDynLabels(baseLabels []string, tags []string) []string {
 	return baseLabels
 }
 
-func NewRDSExporter(sdkConfig aws.Config) *RDSExporter {
+func NewRDSExporter(sdkConfig aws.Config, ttl *time.Duration) *RDSExporter {
 	return &RDSExporter{
 		sdkConfig:  sdkConfig,
 		cache:      []prometheus.Metric{},
+		cacheTTL:   *ttl,
 		lastUpdate: time.Time{},
 	}
 }
@@ -79,7 +81,7 @@ func (e *RDSExporter) Collect(ch chan<- prometheus.Metric) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if time.Since(e.lastUpdate) < time.Hour {
+	if time.Since(e.lastUpdate) < e.cacheTTL {
 		for _, metric := range e.cache {
 			ch <- metric
 		}
@@ -149,10 +151,14 @@ func (e *RDSExporter) collectRegionMetrics(regionName string, ch chan<- promethe
 			}
 			labels = append(labels, *instance.StorageType)
 			labels = append(labels, regionName)
-			labels = append(labels, *instance.DBInstanceArn)
 			labels = append(labels, *instance.DBInstanceClass)
 			labels = append(labels, *instance.Engine)
 
+			// Build tags map
+			tagMap := make(map[string]string)
+			for _, tag := range tags {
+				tagMap[tag] = ""
+			}
 			// fetch tags
 			tagsOutput, err := rdsClient.ListTagsForResource(context.TODO(), &rds.ListTagsForResourceInput{
 				ResourceName: instance.DBInstanceArn,
@@ -160,17 +166,16 @@ func (e *RDSExporter) collectRegionMetrics(regionName string, ch chan<- promethe
 			if err != nil {
 				log.Printf("Error listing tags for RDS instance %s : %v", *instance.DBInstanceArn, err)
 			} else {
-				if len(tagsOutput.TagList) == 0 {
-					for range tags {
-						labels = append(labels, "")
-					}
-				} else {
-					for _, tag := range tagsOutput.TagList {
-						if tag.Key != nil && tag.Value != nil && slices.Contains(tags, *tag.Key) {
-							labels = append(labels, *tag.Value)
-						}
+				for _, tag := range tagsOutput.TagList {
+					if tag.Key != nil && tag.Value != nil && slices.Contains(tags, *tag.Key) {
+						tagMap[*tag.Key] = *tag.Value
 					}
 				}
+			}
+
+			// Add tags in correct order to labels
+			for _, tag := range tags {
+				labels = append(labels, tagMap[tag])
 			}
 			// New metrics
 			if instance.AllocatedStorage != nil {
@@ -203,15 +208,17 @@ func (e *RDSExporter) collectRegionMetrics(regionName string, ch chan<- promethe
 }
 
 func main() {
-	listenPort := flag.String("port", utils.LookupEnv)
-	sdkConfig, err := config.LoadDefaultConfig(context.TODO())
+	listenPort := flag.String("port", "6999", "Exporter listen port")
+	cacheTTL := flag.Duration("cache_ttl", time.Hour, "Cache TTL")
+	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	sdkConfig, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		log.Fatalf("unable to load SDK config: %v", err)
 	}
-	exporter := NewRDSExporter(sdkConfig)
+	exporter := NewRDSExporter(sdkConfig, cacheTTL)
 	prometheus.MustRegister(exporter)
 	http.Handle("/metrics", promhttp.Handler())
-	log.Println("Listening on :9090")
-	log.Fatal(http.ListenAndServe(":9090", nil))
+	log.Println("Listening on :" + *listenPort)
+	log.Fatal(http.ListenAndServe(":"+*listenPort, nil))
 	// унести в флаг таймаут, порт
 }
