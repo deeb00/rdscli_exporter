@@ -51,7 +51,8 @@ type RDSExporter struct {
 	cache      []prometheus.Metric
 	cacheTTL   time.Duration
 	lastUpdate time.Time
-	mu         sync.Mutex
+	mu         sync.RWMutex
+	updateMu   sync.Mutex
 }
 
 func createDynLabels(baseLabels []string, tags []string) []string {
@@ -78,27 +79,21 @@ func (e *RDSExporter) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (e *RDSExporter) Collect(ch chan<- prometheus.Metric) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if time.Since(e.lastUpdate) < e.cacheTTL {
-		for _, metric := range e.cache {
-			ch <- metric
-		}
-		return
-	}
-
-	go e.updateCache()
-
-	// Return cached metrics when cache in updating process
+	e.mu.RLock()
 	for _, metric := range e.cache {
 		ch <- metric
+	}
+	cacheExpired := time.Since(e.lastUpdate) >= e.cacheTTL
+	e.mu.RUnlock()
+
+	if cacheExpired {
+		go e.updateCache()
 	}
 }
 
 func (e *RDSExporter) updateCache() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.updateMu.Lock()
+	defer e.updateMu.Unlock()
 
 	accountClient := account.NewFromConfig(e.sdkConfig)
 	regionOutput, err := accountClient.ListRegions(context.TODO(), &account.ListRegionsInput{
@@ -126,8 +121,10 @@ func (e *RDSExporter) updateCache() {
 	for metric := range metricsChan {
 		newCache = append(newCache, metric)
 	}
+	e.mu.Lock()
 	e.cache = newCache
 	e.lastUpdate = time.Now()
+	e.mu.Unlock()
 }
 
 func (e *RDSExporter) collectRegionMetrics(regionName string, ch chan<- prometheus.Metric) {
