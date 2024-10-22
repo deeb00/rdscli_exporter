@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"log"
+	log "github.com/sirupsen/logrus"
 	"net/http"
 	"os/signal"
 	"slices"
@@ -210,13 +210,37 @@ func main() {
 	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
 	sdkConfig, err := config.LoadDefaultConfig(ctx)
 	flag.Parse()
+
+	logger := log.WithFields(log.Fields{"app": "rds-exporter"})
+
 	if err != nil {
-		log.Fatalf("unable to load SDK config: %v", err)
+		logger.Fatalf("unable to load SDK config: %v", err)
 	}
 	exporter := NewRDSExporter(sdkConfig, cacheTTL)
 	prometheus.MustRegister(exporter)
 	http.Handle("/metrics", promhttp.Handler())
-	log.Println("Listening on :" + *listenPort)
-	log.Fatal(http.ListenAndServe(":"+*listenPort, nil))
-	// унести в флаг таймаут, порт
+	logger.Println("Listening on :" + *listenPort)
+	http.HandleFunc("/readyz", func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(200)
+		writer.Write([]byte(`{"status":"OK"}`))
+	})
+	http.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(200)
+		writer.Write([]byte(`{"status":"OK"}`))
+	})
+	if err := http.ListenAndServe(":"+*listenPort, nil); err != nil {
+		logger.Fatalf("Error starting metric server: %s", err)
+	}
 }
+
+//    TODO:
+// Я так бегло глянул, чуть накидал комментов, чуть позже детальнее ещё гляну
+// глянь пока на комменты ну и докинь ещё докерфайл плиз - по аналогии с остальными
+// заодно можно и сборку прикрутить чтобы сразу всё было
+// по архитектуре - что я бы ещё сделал
+// я бы не стал городить логику с проверкой времени протухания кеша
+// я бы ещё при запуске main запускал бы горутинку updateCache() по тику таймера ну или по forever-циклу со слипом - неважно сколько данные пролежали в кеше, главное что их нужно обновлять каждые n-тиков времени
+// из метода коллект тогда можно всё вытащить, кроме отдачи метрик
+// это кмк немного прозрачнее - те стартует приложенька ну и в фоне потихоньку апдейтит метрики
+//
+// ну и ещё допилить классику - сделать readyz / healthz эндпоинт, логи обвернуть в json
